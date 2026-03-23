@@ -4,6 +4,9 @@ node_modules/
 # Environment variables
 .env
 
+# Cookies (session data)
+cookies.json
+
 # Output files
 output/*
 !output/.gitkeep
