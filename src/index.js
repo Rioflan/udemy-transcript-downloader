@@ -155,6 +155,22 @@ async function main() {
     });
   });
 
+  const contentsPath = path.join(outputDir, 'CONTENTS.txt');
+  const structureCachePath = path.join(outputDir, 'course-structure.json');
+  const contentsExists = fs.existsSync(contentsPath) && fs.existsSync(structureCachePath);
+  const skipCourseFetch = contentsExists && await new Promise((resolve) => {
+    rl.question('CONTENTS.txt already exists. Skip course structure fetching? (yes/no) [yes]: ', (answer) => {
+      const normalized = answer.trim().toLowerCase();
+      resolve(normalized === '' || normalized === 'yes' || normalized === 'y');
+    });
+  });
+
+  const language = await new Promise((resolve) => {
+    rl.question('Preferred language code (e.g. en_US, fr_FR) [leave blank for default]: ', (answer) => {
+      resolve(answer.trim() || null);
+    });
+  });
+
   console.log('Launching browser...');
   const browser = await puppeteerExtra.launch({
     headless: 'new',
@@ -257,20 +273,29 @@ async function main() {
 
     console.log(`Course ID: ${courseId}`);
 
-    const apiBaseUrl = isUdemyBusiness ? new URL(currentUrl).origin : 'https://www.udemy.com';
-    const apiUrl = `${apiBaseUrl}/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=200&fields%5Blecture%5D=title,object_index,is_published,sort_order,created,asset,supplementary_assets,is_free&fields%5Bquiz%5D=title,object_index,is_published,sort_order,type&fields%5Bpractice%5D=title,object_index,is_published,sort_order&fields%5Bchapter%5D=title,object_index,is_published,sort_order&fields%5Basset%5D=title,filename,asset_type,status,time_estimation,is_external,transcript,captions&caching_intent=True`;
+    let courseStructure;
 
-    console.log('Fetching course content...');
-    const allResults = await fetchAllPages(page, apiUrl);
+    if (skipCourseFetch) {
+      console.log('Loading course structure from cache...');
+      courseStructure = JSON.parse(fs.readFileSync(structureCachePath, 'utf8'));
+    } else {
+      const apiBaseUrl = isUdemyBusiness ? new URL(currentUrl).origin : 'https://www.udemy.com';
+      const apiUrl = `${apiBaseUrl}/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=200&fields%5Blecture%5D=title,object_index,is_published,sort_order,created,asset,supplementary_assets,is_free&fields%5Bquiz%5D=title,object_index,is_published,sort_order,type&fields%5Bpractice%5D=title,object_index,is_published,sort_order&fields%5Bchapter%5D=title,object_index,is_published,sort_order&fields%5Basset%5D=title,filename,asset_type,status,time_estimation,is_external,transcript,captions&caching_intent=True`;
 
-    console.log('Processing course structure...');
-    const courseStructure = processCourseStructure(allResults);
+      console.log('Fetching course content...');
+      const allResults = await fetchAllPages(page, apiUrl);
 
-    console.log('Generating CONTENTS.txt...');
-    generateContentsFile(courseStructure);
+      console.log('Processing course structure...');
+      courseStructure = processCourseStructure(allResults);
+
+      fs.writeFileSync(structureCachePath, JSON.stringify(courseStructure), 'utf8');
+
+      console.log('Generating CONTENTS.txt...');
+      generateContentsFile(courseStructure);
+    }
 
     console.log('Downloading transcripts...');
-    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount, skipExisting);
+    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount, skipExisting, language);
 
     console.log('All transcripts downloaded successfully!');
   } catch (error) {
@@ -420,6 +445,23 @@ function normalizeTimestamp(ts) {
   return `${parts.map(p => p.padStart(2, '0')).join(':')},${(ms || '000').padEnd(3, '0')}`;
 }
 
+function vttToText(vtt) {
+  return vtt
+    .replace(/^WEBVTT(\n|\r|\r\n)?/, '')
+    .trim()
+    .split(/\n{2,}/)
+    .map(block => {
+      const lines = block.trim().split('\n').filter(l =>
+        l.trim() &&
+        !/^\d+$/.test(l.trim()) &&
+        !l.includes('-->')
+      );
+      return lines.join(' ');
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 function convertVttToSrt(vtt) {
   return vtt
     .replace(/^WEBVTT(\n|\r|\r\n)?/, '')
@@ -459,7 +501,7 @@ function generateContentsFile(courseStructure) {
   console.log('CONTENTS.txt created.');
 }
 
-async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5, skipExisting = true) {
+async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5, skipExisting = true, language = null) {
   const allLectures = [];
 
   for (const chapter of courseStructure.chapters) {
@@ -479,14 +521,14 @@ async function downloadTranscripts(browser, courseUrl, courseStructure, download
     console.log(`Tab ${tabIndex + 1}: processing ${chunk.length} lectures`);
 
     for (const { lecture, chapter } of chunk) {
-      await processLecture(page, courseUrl, lecture, chapter, downloadSrt, skipExisting);
+      await processLecture(page, courseUrl, lecture, chapter, downloadSrt, skipExisting, language);
     }
 
     await page.close();
   }));
 }
 
-async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false, skipExisting = true) {
+async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false, skipExisting = true, language = null) {
   const baseUrl = courseUrl.endsWith('/') ? courseUrl.slice(0, -1) : courseUrl;
   const lectureUrl = `${baseUrl}/learn/lecture/${lecture.id}`;
   const filename = chapter
@@ -501,7 +543,43 @@ async function processLecture(page, courseUrl, lecture, chapter = null, download
 
   console.log(`Processing: ${sanitizedFilename}`);
 
+  // Find a matching caption for the requested language (partial match: "en" matches "en_US")
+  const matchingCaption = language
+    ? lecture.captions?.find(c => c.locale_id?.toLowerCase().startsWith(language.toLowerCase()))
+    : null;
+
   try {
+    // If a matching caption exists, derive transcript from VTT (no UI scraping needed)
+    if (matchingCaption) {
+      await page.goto(lectureUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+
+      const vttContent = await page.evaluate(async (url) => {
+        const res = await fetch(url);
+        return await res.text();
+      }, matchingCaption.url);
+
+      const transcriptText = vttToText(vttContent);
+      fs.writeFileSync(
+        path.join(outputDir, `${sanitizedFilename}.txt`),
+        `# ${sanitizedFilename}\n\n${transcriptText}`,
+        'utf8'
+      );
+
+      if (downloadSrt) {
+        const srtContent = convertVttToSrt(vttContent);
+        const langTag = matchingCaption.locale_id || 'unknown';
+        fs.writeFileSync(
+          path.join(outputDir, `${sanitizedFilename} [${langTag}].srt`),
+          srtContent,
+          'utf8'
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+      return;
+    }
+
+    // Fallback: scrape transcript from UI panel
     await page.goto(lectureUrl, { waitUntil: 'networkidle2', timeout: 60000 });
     await page.waitForSelector('video', { timeout: 30000, visible: true }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 2000));
