@@ -148,6 +148,13 @@ async function main() {
     });
   });
 
+  const skipExisting = await new Promise((resolve) => {
+    rl.question('Skip already downloaded lectures? (yes/no) [yes]: ', (answer) => {
+      const normalized = answer.trim().toLowerCase();
+      resolve(normalized === '' || normalized === 'yes' || normalized === 'y');
+    });
+  });
+
   console.log('Launching browser...');
   const browser = await puppeteerExtra.launch({
     headless: 'new',
@@ -263,7 +270,7 @@ async function main() {
     generateContentsFile(courseStructure);
 
     console.log('Downloading transcripts...');
-    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount);
+    await downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount, skipExisting);
 
     console.log('All transcripts downloaded successfully!');
   } catch (error) {
@@ -452,7 +459,7 @@ function generateContentsFile(courseStructure) {
   console.log('CONTENTS.txt created.');
 }
 
-async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5) {
+async function downloadTranscripts(browser, courseUrl, courseStructure, downloadSrt, tabCount = 5, skipExisting = true) {
   const allLectures = [];
 
   for (const chapter of courseStructure.chapters) {
@@ -472,20 +479,25 @@ async function downloadTranscripts(browser, courseUrl, courseStructure, download
     console.log(`Tab ${tabIndex + 1}: processing ${chunk.length} lectures`);
 
     for (const { lecture, chapter } of chunk) {
-      await processLecture(page, courseUrl, lecture, chapter, downloadSrt);
+      await processLecture(page, courseUrl, lecture, chapter, downloadSrt, skipExisting);
     }
 
     await page.close();
   }));
 }
 
-async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false) {
+async function processLecture(page, courseUrl, lecture, chapter = null, downloadSrt = false, skipExisting = true) {
   const baseUrl = courseUrl.endsWith('/') ? courseUrl.slice(0, -1) : courseUrl;
   const lectureUrl = `${baseUrl}/learn/lecture/${lecture.id}`;
   const filename = chapter
     ? `${chapter.index}.${lecture.lectureIndex} ${lecture.title}`
     : `${lecture.lectureIndex}. ${lecture.title}`;
   const sanitizedFilename = filename.replace(/[/\\?%*:|"<>]/g, '-');
+
+  if (skipExisting && fs.existsSync(path.join(outputDir, `${sanitizedFilename}.txt`))) {
+    debug(`Skipping already downloaded: ${sanitizedFilename}`);
+    return;
+  }
 
   console.log(`Processing: ${sanitizedFilename}`);
 
