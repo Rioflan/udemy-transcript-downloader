@@ -254,33 +254,10 @@ async function main() {
     const apiUrl = `${apiBaseUrl}/api-2.0/courses/${courseId}/subscriber-curriculum-items/?page_size=200&fields%5Blecture%5D=title,object_index,is_published,sort_order,created,asset,supplementary_assets,is_free&fields%5Bquiz%5D=title,object_index,is_published,sort_order,type&fields%5Bpractice%5D=title,object_index,is_published,sort_order&fields%5Bchapter%5D=title,object_index,is_published,sort_order&fields%5Basset%5D=title,filename,asset_type,status,time_estimation,is_external,transcript,captions&caching_intent=True`;
 
     console.log('Fetching course content...');
-    let courseJson = null;
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        await page.goto(apiUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        const rawBody = await page.evaluate(() => document.body.innerText);
-        if (rawBody.trim().startsWith('<!DOCTYPE html>')) {
-          throw new Error('HTML response instead of JSON');
-        }
-
-        courseJson = JSON.parse(rawBody);
-        if (courseJson && courseJson.results) break;
-        throw new Error('No results in response');
-      } catch (err) {
-        console.warn(`Attempt ${attempt} failed: ${err.message}`);
-        if (attempt < 3) {
-          await new Promise(resolve => setTimeout(resolve, 5000));
-        } else {
-          throw new Error('Could not retrieve course content.');
-        }
-      }
-    }
+    const allResults = await fetchAllPages(page, apiUrl);
 
     console.log('Processing course structure...');
-    const courseStructure = processCourseStructure(courseJson.results);
+    const courseStructure = processCourseStructure(allResults);
 
     console.log('Generating CONTENTS.txt...');
     generateContentsFile(courseStructure);
@@ -342,6 +319,48 @@ async function performLogin(page) {
 
   await new Promise(resolve => setTimeout(resolve, 5000));
   console.log('Login successful!');
+}
+
+async function fetchAllPages(page, url) {
+  const results = [];
+  let nextUrl = url;
+  let pageNum = 1;
+
+  while (nextUrl) {
+    let pageJson = null;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await page.goto(nextUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        const rawBody = await page.evaluate(() => document.body.innerText);
+        if (rawBody.trim().startsWith('<!DOCTYPE html>')) {
+          throw new Error('HTML response instead of JSON');
+        }
+
+        pageJson = JSON.parse(rawBody);
+        if (pageJson?.results) break;
+        throw new Error('No results in response');
+      } catch (err) {
+        console.warn(`Page ${pageNum}, attempt ${attempt} failed: ${err.message}`);
+        if (attempt < 3) {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        } else {
+          throw new Error('Could not retrieve course content.');
+        }
+      }
+    }
+
+    results.push(...pageJson.results);
+    debug(`Fetched page ${pageNum} (${pageJson.results.length} items, total: ${results.length})`);
+
+    nextUrl = pageJson.next || null;
+    pageNum++;
+  }
+
+  console.log(`Fetched ${results.length} items across ${pageNum - 1} page(s).`);
+  return results;
 }
 
 function processCourseStructure(results) {
